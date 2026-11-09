@@ -1,0 +1,259 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>Проверка заявок AdsGalaxy</title>
+    <style>
+      body {
+        max-width: 56rem;
+        margin: 3rem auto;
+        padding: 0 1rem;
+        font: 16px/1.5 system-ui;
+      }
+      button {
+        font: inherit;
+        padding: 0.45rem 0.8rem;
+      }
+      pre {
+        white-space: pre-wrap;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>Проверка заявок AdsGalaxy</h1>
+    <p>
+      Проверка запускает обе формы в изолированной копии страницы. Сетевые запросы из неё блокирует политика
+      браузера.
+    </p>
+    <button type="button">Запустить проверку</button>
+    <pre role="status"></pre>
+    <script type="module">
+      const run = document.querySelector('button');
+      const status = document.querySelector('pre');
+      const assert = (value, label) => {
+        if (!value) throw Error(label);
+      };
+
+      async function pageSource() {
+        for (const path of ['../dist/index.html', '../index.html']) {
+          const response = await fetch(path);
+          if (!response.ok) continue;
+          const doc = new DOMParser().parseFromString(await response.text(), 'text/html');
+          if (!doc.querySelector('[data-modal-form]')) continue;
+          const base = doc.createElement('base');
+          base.href = new URL('.', response.url).href;
+          const csp = doc.createElement('meta');
+          csp.httpEquiv = 'Content-Security-Policy';
+          csp.content =
+            "default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self'; font-src 'self'; connect-src 'none'; form-action 'none'; base-uri 'self'";
+          doc.head.prepend(csp, base);
+          doc.querySelector('meta[name="adsgalaxy-lead-endpoint"]').content = './__test-only';
+          doc.querySelector('meta[name="adsgalaxy-thanks"]').content = '';
+          doc.querySelectorAll('form[action]').forEach((form) => {
+            form.action = './__test-only';
+          });
+          return '<!doctype html>\n' + doc.documentElement.outerHTML;
+        }
+        throw Error('Запустите HTTP-сервер из корня проекта или распакованного архива.');
+      }
+
+      function write(input, value) {
+        if (input.type === 'checkbox') input.checked = value;
+        else input.value = value;
+        const view = input.ownerDocument.defaultView;
+        input.dispatchEvent(new view.Event('input', { bubbles: true }));
+        input.dispatchEvent(new view.FocusEvent('focusout', { bubbles: true }));
+      }
+
+      async function checkForm(form, calls) {
+        const field = form.elements,
+          send = form.querySelector('[type="submit"]');
+        const view = form.ownerDocument.defaultView;
+        const start = calls.length;
+        // Use the actual editing events. A blur-only check would miss the original bug.
+        function type(input, value, inputType = 'insertText') {
+          input.value = value;
+          input.dispatchEvent(new view.InputEvent('input', { bubbles: true, inputType }));
+        }
+        const forbidden = new view.InputEvent('beforeinput', {
+          bubbles: true,
+          cancelable: true,
+          inputType: 'insertText',
+          data: '9#',
+        });
+        assert(!field.name.dispatchEvent(forbidden), 'Можно напечатать цифру или знак в имени');
+        type(field.name, '9!🙂', 'insertFromPaste');
+        assert(
+          field.name.value === '' && !!field.name.validationMessage,
+          'Вставка пропустила цифры или эмодзи',
+        );
+        field.name.value = 'Ив9!ан';
+        field.name.setSelectionRange(4, 4);
+        field.name.dispatchEvent(
+          new view.InputEvent('input', { bubbles: true, inputType: 'insertFromPaste' }),
+        );
+        assert(
+          field.name.value === 'Иван' && field.name.selectionStart === 2,
+          'Вставка изменила позицию курсора',
+        );
+        type(field.name, '  Анна12   Петр★ова🙂', 'insertFromDrop');
+        assert(field.name.value === 'Анна Петрова', 'Перетаскивание сохранило посторонние символы');
+        field.name.dispatchEvent(new view.CompositionEvent('compositionstart', { bubbles: true }));
+        type(field.name, 'Жа9н');
+        assert(field.name.value === 'Жа9н' && send.disabled, 'Фильтр прервал ввод с экранной клавиатуры');
+        field.name.dispatchEvent(new view.CompositionEvent('compositionend', { bubbles: true }));
+        assert(field.name.value === 'Жан', 'Ввод после compositionend остался непроверенным');
+        type(field.name, 'Анна');
+        type(field.contact, 'x@@site.ru', 'insertFromPaste');
+        assert(
+          field.contact.getAttribute('aria-invalid') === 'true',
+          'Вставленная ошибка почты скрыта до потери фокуса',
+        );
+        type(field.contact, '@qa_team');
+        assert(!field.contact.hasAttribute('aria-invalid'), 'Исправление контакта не убрало ошибку');
+        type(field.site, 'нет сайта');
+        await new Promise((resolve) => setTimeout(resolve, 650));
+        assert(field.site.getAttribute('aria-invalid') === 'true', 'Неверный сайт не отмечен во время ввода');
+        write(field.contact, 'qa@example.invalid');
+        write(field.site, '');
+        form.requestSubmit();
+        assert(send.disabled && calls.length === start, 'Форма доступна без согласия');
+        write(field.consent, true);
+        assert(!send.disabled, 'Отправка заблокирована при отмеченном согласии');
+
+        const cases = {
+          name: {
+            bad: ['', 'Я', '123', 'Иван2', 'А😊', 'Анна-Мария', "D'Angelo", 'Иван  Петров'],
+            good: ['Анна Мария', 'José da Silva', 'Zoë', '李明', 'नन्दिनी', 'Е\u0308лка'],
+          },
+          contact: {
+            bad: [
+              '',
+              '89991112233',
+              'a..b@site.ru',
+              'x@localhost',
+              'username',
+              'текст',
+              'ivan@@example.ru',
+              '@я_здесь',
+              '@nick_',
+              'https://t.me/+123456789',
+            ],
+            good: ['qa+lead@example.invalid', '@qa_team', 'https://t.me/qa_team/', 'qa_team.t.me'],
+          },
+          site: {
+            bad: [
+              'localhost',
+              'ftp://site.ru',
+              'https://bad..ru',
+              'javascript:alert(1)',
+              '127.0.0.1',
+              'https://login:pass@site.ru',
+              'https://',
+              'пример.рф:99999',
+            ],
+            good: ['', 'пример.рф', 'example.com/path?q=1'],
+          },
+        };
+        for (const [name, values] of Object.entries(cases)) {
+          const input = field.namedItem(name);
+          const error = form.querySelector('[data-error-for="' + name + '"]');
+          for (const value of values.bad) {
+            // Bypass editing deliberately and check the last guard on the submit path too.
+            input.value = value;
+            form.requestSubmit();
+            assert(
+              calls.length === start &&
+                send.disabled &&
+                !!error.textContent &&
+                input.getAttribute('aria-invalid') === 'true',
+              name + ' принял ' + JSON.stringify(value),
+            );
+          }
+          for (const value of values.good) {
+            write(input, value);
+            assert(
+              !error.textContent && !input.hasAttribute('aria-invalid'),
+              name + ' отклонил ' + JSON.stringify(value),
+            );
+          }
+        }
+        type(field.name, '9#', 'insertReplacementText');
+        assert(send.disabled && !field.name.value, 'Автозаполнение пропустило посторонний ввод');
+        type(field.name, 'Алексей');
+        assert(!send.disabled, 'Исправленное имя оставило кнопку заблокированной');
+        type(field.contact, 'not_a_contact');
+        assert(send.disabled, 'Согласие включило отправку при неверном контакте');
+        type(field.contact, '@qa_team');
+        type(field.site, 'некорректный сайт');
+        assert(send.disabled, 'Необязательный сайт разрешил отправку с ошибкой');
+        write(field.name, '  Анна  Петрова ');
+        write(field.contact, 'qa+lead@пример.рф');
+        assert(field.contact.value === 'qa+lead@пример.рф', 'Поле подменило читаемый домен до отправки');
+        write(field.site, 'пример.рф/каталог');
+        form.requestSubmit();
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        const email = calls.at(-1);
+        assert(
+          calls.length === start + 1 &&
+            email.name === 'Анна Петрова' &&
+            email.email === 'qa+lead@xn--e1afmkfd.xn--p1ai' &&
+            email.site === new URL('https://пример.рф/каталог').href &&
+            !email.telegram &&
+            !email.phone,
+          'Некорректная заявка по почте',
+        );
+
+        write(field.contact, 't.me/qa_team');
+        write(field.site, '');
+        form.requestSubmit();
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        const tg = calls.at(-1);
+        assert(
+          calls.length === start + 2 &&
+            tg.telegram === '@qa_team' &&
+            tg.contact === tg.telegram &&
+            !tg.email &&
+            !tg.phone &&
+            !tg.site,
+          'Некорректная заявка через Telegram',
+        );
+        write(field.consent, false);
+        form.requestSubmit();
+        assert(calls.length === start + 2 && send.disabled, 'Снятое согласие разрешило повторную отправку');
+      }
+
+      run.onclick = async () => {
+        run.disabled = true;
+        status.textContent = 'Проверка…';
+        const frame = document.createElement('iframe');
+        frame.title = 'Тестовые формы';
+        frame.hidden = true;
+        try {
+          const source = await pageSource();
+          const ready = new Promise((resolve) => (frame.onload = resolve));
+          frame.srcdoc = source;
+          document.body.append(frame);
+          await ready;
+          const calls = [];
+          frame.contentWindow.fetch = async (url, options) => {
+            assert(url === './__test-only' && options.method === 'POST', 'Неожиданный обработчик');
+            calls.push(JSON.parse(options.body));
+            return new Response('', { status: 503 });
+          };
+          for (const form of frame.contentDocument.querySelectorAll('form[data-form],form[data-modal-form]'))
+            await checkForm(form, calls);
+          assert(calls.length === 4, 'Проверены не обе формы');
+          status.textContent =
+            'Пройдено. В обеих формах проверены набор, вставка, курсор, IME, автозаполнение, email, Telegram, сайт, согласие и данные заявки.';
+        } catch (error) {
+          status.textContent = 'Ошибка. ' + error.message;
+        } finally {
+          frame.remove();
+          run.disabled = false;
+        }
+      };
+    </script>
+  </body>
+</html>
